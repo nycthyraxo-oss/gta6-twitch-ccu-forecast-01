@@ -24,14 +24,29 @@ from the donors' curves:
     target. The size slope is the dominant signal: bigger hour-1 launches
     have flatter day curves (correlation about -0.76 between log hour-1
     and log peak ratio across the donors).
-  * Spread: weighted standard deviation of the regression residuals,
-    winsorised at the weighted median +/- 2 sd, scaled by 1.1, floored at
-    0.30 log units and capped at 1.20. Both centre and spread are smoothed
-    across neighbouring hours (0.25/0.5/0.25).
+  * Median re-anchor (v5): the ridge centre carries a small systematic
+    bias (the pooled standardised residuals have median about -0.15, i.e.
+    the centre sits high). Per hour, b(h) = n_h * median(residuals) /
+    (n_h + 10) is added to the centre, where the residuals are the
+    UNwinsorised donor residuals after the centre fit. Leave-one-out:
+    this alone cuts mean pinball loss 0.395 -> 0.380.
+  * Spread: weighted standard deviation of the UNwinsorised regression
+    residuals (v4 winsorised them; unwinsorised is worth a further
+    ~0.002), scaled by 1.05 (the 1.00-1.10 plateau is flat; 1.05 is its
+    centre), floored at 0.30 log units and capped at 1.20. Both centre
+    and spread are smoothed across neighbouring hours (0.25/0.5/0.25).
   * Quantiles: p1 * exp(centre_h + z_tau * sigma_h), z the standard normal
-    quantiles. This is a proper distributional forecast for the pinball
-    loss on the log scale: the median tracks the expected curve and the
-    spread reflects how much launch days actually vary.
+    quantiles. Empirical asymmetric quantile constants were tried in
+    leave-one-out (pooled + per-hour shrunk, kappa 4/8/16, pure and
+    70/30 Gaussian blend, in-sample and honest leave-one-donor-out
+    residuals) and did NOT beat the Gaussian table -- the pooled
+    empirical constants are nearly Gaussian anyway
+    ([-1.54, -0.56, -0.15, 0.56, 1.69] vs z), so the shape was never the
+    leak; the centre bias was. A quadratic size feature (dx^2, clamped)
+    and a big-launch donor regime (top 10-12 donors, bw 0.65) were also
+    tried and both HURT leave-one-out (quad +0.019, big regime +0.001
+    overall / +0.021 on big launches, driven by a threshold cliff at
+    h1 ~ 10k: one target 0.317 -> 0.904), so neither is in v5.
 
 The target's own pre-release history (history_hourly) supplies its ramp
 feature; the Grand Theft Auto VI category's own pre-release
@@ -44,13 +59,16 @@ under the 8 s cap (milliseconds per case, standard library only).
 Validation (leave-one-out over the 38 comparable launches in the kit's
 practice cases, each launch forecast from the other 37):
   house persistence baseline: mean pinball loss 0.930 (median 0.325)
-  this model:                    mean 0.395 (median 0.274)
+  v4 model:                    mean 0.395 (median 0.274)
+  v5 model:                    mean 0.380 (median 0.269)
   on launches with hour-1 >= 10k viewers (the regime of the practice
-  targets and of GTA VI itself): mean 0.255, median 0.183, 90% coverage
-  0.86. The practice targets are all large console rolling-midnight
-  launches (hour-1 23k-270k viewers), the regime where the model is
-  strongest; the final case additionally includes those four launches
-  as donors.
+  targets and of GTA VI itself): v4 mean 0.255, median 0.183, 90%
+  coverage 0.86; v5 mean 0.250, median 0.194, 90% coverage 0.89.
+  Paired improvement v5 vs v4: -0.015 mean loss (paired SE 0.005),
+  clear of the ~0.01 noise floor. The practice targets are all large
+  console rolling-midnight launches (hour-1 23k-270k viewers), the regime
+  where the model is strongest; the final case additionally includes
+  those four launches as donors.
 """
 
 import json
@@ -76,9 +94,12 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 BW_SIZE = 1.2        # Gaussian kernel bandwidth on log hour-1 size
 RIDGE = 2.0          # ridge strength on the regression slopes
 WINSOR_SD = 2.0      # winsorise donor log-ratios at median +/- this sd
-SIG_SCALE = 1.1      # residual-spread calibration multiplier
+                     # (centre fit ONLY -- spread/quantiles use raw residuals)
+SIG_SCALE = 1.05     # residual-spread calibration multiplier (1.00-1.10
+                     # plateau is flat on LOO pinball; 1.05 is its centre)
 SIG_FLOOR = 0.30     # minimum log-spread per hour
 SIG_CAP = 1.20       # maximum log-spread per hour
+ANCHOR_DENOM = 10    # median re-anchor shrinkage: b = n*median/(n+10)
 W_CONSOLE = 1.3      # weight boost for console-only donors
 W_EARLY_ACCESS = 0.35
 W_WEAK = 0.25
@@ -198,7 +219,9 @@ def release_day_values(comp):
         except (KeyError, TypeError, ValueError):
             continue
         h = int((t - ds).total_seconds() // 3600) + 1
-        if 1 <= h <= 24 and row.get("viewers"):
+        # A zero-viewer hour is real data (a dead category hour), not a
+        # missing row: keep it, clamped to 1.0 below. Only None is missing.
+        if 1 <= h <= 24 and row.get("viewers") is not None:
             by_hour[h] = max(1.0, float(row["viewers"]))
     if 1 not in by_hour or len(by_hour) < 18:
         return None
@@ -238,13 +261,15 @@ def pre_features(hourly, day_start):
             continue
         dh = (t - ds).total_seconds() / 3600
         viewers = row.get("viewers")
-        if not viewers:
+        if viewers is None:
             continue
         if -24 <= dh < 0:
             pre24.append(float(viewers))
-        if dh == -1:
+        # Timestamp tolerance (30 s): hourly rows should sit exactly on
+        # -1h/0h, but never rely on exact float equality to find them.
+        if abs(dh + 1) < 1 / 120:
             at_minus1 = float(viewers)
-        if dh == 0:
+        if abs(dh) < 1 / 120:
             v1 = float(viewers)
     if v1 is None or v1 <= 0:
         return 0.0, 0.0
@@ -329,21 +354,29 @@ def forecast_case(case):
     lp1 = math.log(p1)
     centers, sigmas = {}, {}
     for h in hours:
-        xs, ys, ws = [], [], []
+        xs, ys_raw, ws = [], [], []
         for d in donors:
             ws.append(donor_weight(d, lp1, target_uclass))
             xs.append([d["lv1"] - lp1, d["ramp"] - ramp_t])
-            ys.append(math.log(d["vals"][h - 1] / d["vals"][0]))
+            ys_raw.append(math.log(d["vals"][h - 1] / d["vals"][0]))
         # Winsorise the donor log-ratios so one explosive launch day
-        # cannot drag the centre or inflate the spread for everyone.
-        med = wquantile(list(zip(ys, ws)), 0.5)
-        sd = wstd([(y - med, w) for y, w in zip(ys, ws)], 0.0) or 0.5
+        # cannot drag the centre fit. The spread and the median
+        # re-anchor below use the UNwinsorised residuals: winsorising
+        # them would understate how much launch days actually vary.
+        med = wquantile(list(zip(ys_raw, ws)), 0.5)
+        sd = wstd([(y - med, w) for y, w in zip(ys_raw, ws)], 0.0) or 0.5
         lo, hi = med - WINSOR_SD * sd, med + WINSOR_SD * sd
-        ys = [min(max(y, lo), hi) for y in ys]
+        ys = [min(max(y, lo), hi) for y in ys_raw]
         co = solve_ridge(xs, ys, ws, RIDGE)
-        centers[h] = co[0]
-        resid = [(y - (co[0] + sum(c * x for c, x in zip(co[1:], xi))), w)
-                 for xi, y, w in zip(xs, ys, ws)]
+        pred = [co[0] + sum(c * x for c, x in zip(co[1:], xi)) for xi in xs]
+        # Median re-anchor: the ridge centre sits systematically high
+        # (median donor residual is negative). Shift the centre by the
+        # shrunk weighted median residual, then recompute residuals.
+        resid = [(y - p, w) for y, p, w in zip(ys_raw, pred, ws)]
+        n_h = len(resid)
+        bias = n_h * wquantile(resid, 0.5) / (n_h + ANCHOR_DENOM)
+        centers[h] = co[0] + bias
+        resid = [(y - (p + bias), w) for y, p, w in zip(ys_raw, pred, ws)]
         sigmas[h] = wstd(resid, 0.0)
 
     def smooth(d):
