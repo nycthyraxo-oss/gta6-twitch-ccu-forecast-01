@@ -311,9 +311,9 @@ def forecast_case(case):
     if known is None:
         raise ValueError("case has no hour-1 print")
     p1 = max(1.0, float(known["viewers"]))
-    hours = [row["hour"] for row in case.get("forecast") or []]
-    if not hours:
-        hours = list(range(2, 25))
+    # Always emit exactly hours 2..24, regardless of the case's forecast
+    # rows (a case shipping any other rows must not change the output shape).
+    hours = list(range(2, 25))
 
     # Target features from its own pre-checkpoint history (the ramp: how
     # hour 1 compares with the hour before the release day started).
@@ -373,9 +373,8 @@ def fallback_forecast(case):
     known = next((k for k in case.get("known") or [] if k.get("hour") == 1),
                  None)
     p1 = max(1.0, float(known["viewers"])) if known else 1.0
-    hours = [row["hour"] for row in case.get("forecast") or []]
-    if not hours:
-        hours = list(range(2, 25))
+    # Always emit exactly hours 2..24 (see forecast_case).
+    hours = list(range(2, 25))
     return {"hours": [{"hour": h, "q": baseline_quantiles(p1, h)}
                       for h in hours]}
 
